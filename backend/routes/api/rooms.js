@@ -3,6 +3,8 @@ const router = express.Router();
 const auth = require('../../middleware/auth');
 const Room = require('../../models/Room');
 const User = require('../../models/User');
+const CacheService = require('../../services/cacheService');
+const redisClient = require('../../utils/redisClient');
 const { rateLimit } = require('express-rate-limit');
 let io;
 
@@ -42,6 +44,22 @@ router.get('/health', async (req, res) => {
     const [seconds, nanoseconds] = process.hrtime(start);
     const latency = Math.round((seconds * 1000) + (nanoseconds / 1000000));
 
+    // 🚀 Redis 캐시 상태 확인
+    let cacheStatus = 'unknown';
+    let cacheLatency = 0;
+    
+    try {
+      const cacheStart = process.hrtime();
+      await redisClient.set('health:check', 'ok', { ttl: 10 });
+      const cacheResult = await redisClient.get('health:check');
+      const [cacheSec, cacheNano] = process.hrtime(cacheStart);
+      cacheLatency = Math.round((cacheSec * 1000) + (cacheNano / 1000000));
+      cacheStatus = cacheResult === 'ok' ? 'connected' : 'error';
+    } catch (cacheError) {
+      cacheStatus = 'disconnected';
+      console.error('Cache health check error:', cacheError);
+    }
+
     const status = {
       success: true,
       timestamp: new Date().toISOString(),
@@ -49,6 +67,11 @@ router.get('/health', async (req, res) => {
         database: {
           connected: isMongoConnected,
           latency
+        },
+        cache: {
+          status: cacheStatus,
+          latency: cacheLatency,
+          type: cacheStatus === 'disconnected' ? 'in-memory-mock' : 'redis'
         }
       },
       lastActivity: recentRoom?.createdAt
@@ -60,7 +83,8 @@ router.get('/health', async (req, res) => {
       'Expires': '0'
     });
 
-    res.status(isMongoConnected ? 200 : 503).json(status);
+    const httpStatus = (isMongoConnected && cacheStatus !== 'error') ? 200 : 503;
+    res.status(httpStatus).json(status);
 
   } catch (error) {
     console.error('Health check error:', error);
@@ -74,7 +98,7 @@ router.get('/health', async (req, res) => {
   }
 });
 
-// 채팅방 목록 조회 (페이징 적용) - 🚀 LEAN 최적화
+// 채팅방 목록 조회 (페이징 적용) - 🚀 Redis 캐싱 적용
 router.get('/', [limiter, auth], async (req, res) => {
   try {
     // 쿼리 파라미터 검증 (페이지네이션)
@@ -91,10 +115,34 @@ router.get('/', [limiter, auth], async (req, res) => {
       ? req.query.sortOrder
       : 'desc';
 
+    // 검색 필터
+    const search = req.query.search?.trim() || '';
+
+    // 🚀 캐시에서 먼저 확인
+    const cachedResult = await CacheService.getRoomsList(page, pageSize, sortField, sortOrder, search);
+    
+    if (cachedResult) {
+      // 캐시 히트 헤더 추가
+      res.set({
+        'X-Cache': 'HIT',
+        'Cache-Control': 'private, max-age=300',
+        'Last-Modified': new Date().toUTCString()
+      });
+
+      return res.json({
+        success: true,
+        ...cachedResult,
+        cached: true
+      });
+    }
+
+    // 캐시 미스 - DB에서 조회
+    console.log(`[API] Cache miss - fetching rooms from DB`);
+
     // 검색 필터 구성
     const filter = {};
-    if (req.query.search) {
-      filter.name = { $regex: req.query.search, $options: 'i' };
+    if (search) {
+      filter.name = { $regex: search, $options: 'i' };
     }
 
     // 🚀 LEAN 최적화: 총 문서 수 조회
@@ -104,19 +152,19 @@ router.get('/', [limiter, auth], async (req, res) => {
     const rooms = await Room.find(filter)
       .populate({
         path: 'creator',
-        select: 'name email',
-        options: { lean: true } // populate도 lean() 적용
+        select: 'name email profileImage',
+        options: { lean: true }
       })
       .populate({
         path: 'participants',
-        select: 'name email',
-        options: { lean: true } // populate도 lean() 적용
+        select: 'name email profileImage',
+        options: { lean: true }
       })
-      .select('name hasPassword creator participants createdAt') // 필요한 필드만
+      .select('name hasPassword creator participants createdAt')
       .sort({ [sortField]: sortOrder === 'desc' ? -1 : 1 })
       .skip(skip)
       .limit(pageSize)
-      .lean(); // 메인 쿼리도 lean() 적용
+      .lean();
 
     // 안전한 응답 데이터 구성 
     const safeRooms = rooms.map(room => {
@@ -132,12 +180,14 @@ router.get('/', [limiter, auth], async (req, res) => {
         creator: {
           _id: creator._id?.toString() || 'unknown',
           name: creator.name || '알 수 없음',
-          email: creator.email || ''
+          email: creator.email || '',
+          profileImage: creator.profileImage || ''
         },
         participants: participants.filter(p => p && p._id).map(p => ({
           _id: p._id.toString(),
           name: p.name || '알 수 없음',
-          email: p.email || ''
+          email: p.email || '',
+          profileImage: p.profileImage || ''
         })),
         participantsCount: participants.length,
         createdAt: room.createdAt || new Date(),
@@ -149,15 +199,7 @@ router.get('/', [limiter, auth], async (req, res) => {
     const totalPages = Math.ceil(totalCount / pageSize);
     const hasMore = skip + rooms.length < totalCount;
 
-    // 캐시 설정
-    res.set({
-      'Cache-Control': 'private, max-age=10',
-      'Last-Modified': new Date().toUTCString()
-    });
-
-    // 응답 전송
-    res.json({
-      success: true,
+    const responseData = {
       data: safeRooms,
       metadata: {
         total: totalCount,
@@ -171,6 +213,23 @@ router.get('/', [limiter, auth], async (req, res) => {
           order: sortOrder
         }
       }
+    };
+
+    // 🚀 결과를 캐시에 저장
+    await CacheService.setRoomsList(page, pageSize, sortField, sortOrder, search, responseData);
+
+    // 캐시 미스 헤더 추가
+    res.set({
+      'X-Cache': 'MISS',
+      'Cache-Control': 'private, max-age=300',
+      'Last-Modified': new Date().toUTCString()
+    });
+
+    // 응답 전송
+    res.json({
+      success: true,
+      ...responseData,
+      cached: false
     });
 
   } catch (error) {
@@ -213,19 +272,23 @@ router.post('/', auth, async (req, res) => {
 
     const savedRoom = await newRoom.save();
     
-    // 🚀 LEAN 최적화: 생성된 방 정보 조회
-    const populatedRoom = await Room.findById(savedRoom._id)
-      .populate({
-        path: 'creator',
-        select: 'name email',
-        options: { lean: true }
-      })
-      .populate({
-        path: 'participants',
-        select: 'name email',
-        options: { lean: true }
-      })
-      .lean();
+    // 🚀 캐싱된 정보로 응답 데이터 구성
+    const creatorInfo = await CacheService.getUserInfo(req.user.id);
+    
+    const populatedRoom = {
+      _id: savedRoom._id,
+      name: savedRoom.name,
+      hasPassword: !!savedRoom.password,
+      creator: creatorInfo,
+      participants: [creatorInfo],
+      createdAt: savedRoom.createdAt
+    };
+
+    // 🚀 새 방 정보를 캐시에 저장
+    await CacheService.updateRoomInfoCache(savedRoom._id, populatedRoom);
+    
+    // 🚀 방 목록 캐시 무효화
+    await CacheService.invalidateRoomsListCache();
     
     // Socket.IO를 통해 새 채팅방 생성 알림
     if (io) {
@@ -320,16 +383,17 @@ router.post('/:roomId/join', auth, async (req, res) => {
     if (!room.participants.includes(req.user.id)) {
       room.participants.push(req.user.id);
       await room.save();
+
+      // 🚀 관련 캐시 무효화
+      await Promise.all([
+        CacheService.invalidateRoomInfo(req.params.roomId),
+        CacheService.invalidateRoomParticipants(req.params.roomId),
+        CacheService.invalidateRoomsListCache()
+      ]);
     }
 
-    // 🚀 LEAN 최적화: 업데이트된 방 정보 조회
-    const populatedRoom = await Room.findById(room._id)
-      .populate({
-        path: 'participants',
-        select: 'name email',
-        options: { lean: true }
-      })
-      .lean();
+    // 🚀 업데이트된 방 정보를 캐시에서 가져오기
+    const populatedRoom = await CacheService.getRoomInfo(req.params.roomId);
 
     // Socket.IO를 통해 참여자 업데이트 알림
     if (io) {

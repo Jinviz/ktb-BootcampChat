@@ -2,6 +2,7 @@ const User = require('../models/User');
 const jwt = require('jsonwebtoken');
 const { jwtSecret } = require('../config/keys');
 const SessionService = require('../services/sessionService');
+const CacheService = require('../services/cacheService');
 
 const authController = {
   async register(req, res) {
@@ -50,6 +51,16 @@ const authController = {
 
       await user.save();
       console.log('User created:', user._id);
+
+      // 🚀 새 사용자 정보를 캐시에 저장
+      const userCacheData = {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        profileImage: user.profileImage || '',
+        createdAt: user.createdAt
+      };
+      await CacheService.updateUserInfoCache(user._id, userCacheData);
 
       // Create session with metadata
       const sessionInfo = await SessionService.createSession(user._id, {
@@ -363,8 +374,8 @@ const authController = {
         });
       }
 
-      // 사용자 정보 조회
-      const user = await User.findById(decoded.user.id);
+      // 🚀 캐시에서 사용자 정보 조회
+      const user = await CacheService.getUserInfo(decoded.user.id);
       if (!user) {
         return res.status(404).json({
           success: false,
@@ -461,6 +472,9 @@ const authController = {
         throw new Error('Failed to create new session');
       }
 
+      // 🚀 사용자 정보를 캐시에서 가져와서 응답에 포함
+      const cachedUser = await CacheService.getUserInfo(user._id);
+
       // 새로운 JWT 토큰 생성
       const token = jwt.sign(
         { 
@@ -481,10 +495,10 @@ const authController = {
         token,
         sessionId: sessionInfo.sessionId,
         user: {
-          _id: user._id,
-          name: user.name,
-          email: user.email,
-          profileImage: user.profileImage
+          _id: cachedUser._id,
+          name: cachedUser.name,
+          email: cachedUser.email,
+          profileImage: cachedUser.profileImage
         }
       });
 

@@ -1,5 +1,6 @@
 const bcrypt = require('bcryptjs');
 const User = require('../models/User');
+const CacheService = require('../services/cacheService');
 const { upload } = require('../middleware/upload');
 const path = require('path');
 const fs = require('fs').promises;
@@ -99,12 +100,11 @@ exports.register = async (req, res) => {
   }
 };
 
-// 🚀 LEAN 최적화: 프로필 조회
+// 🚀 Redis 캐싱: 프로필 조회
 exports.getProfile = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id)
-      .select('_id name email profileImage') // 필요한 필드만 선택
-      .lean(); // 순수 객체로 조회
+    // 🚀 캐시에서 먼저 확인
+    const user = await CacheService.getUserInfo(req.user.id);
       
     if (!user) {
       return res.status(404).json({
@@ -112,6 +112,12 @@ exports.getProfile = async (req, res) => {
         message: '사용자를 찾을 수 없습니다.'
       });
     }
+
+    // 캐시 히트 헤더 설정
+    res.set({
+      'X-Cache': 'HIT',
+      'Cache-Control': 'private, max-age=1800'
+    });
 
     res.json({
       success: true,
@@ -155,6 +161,20 @@ exports.updateProfile = async (req, res) => {
 
     user.name = name.trim();
     await user.save();
+
+    // 🚀 사용자 정보 캐시 업데이트
+    const updatedUserData = {
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      profileImage: user.profileImage,
+      createdAt: user.createdAt
+    };
+    
+    await CacheService.updateUserInfoCache(req.user.id, updatedUserData);
+
+    // 🚀 관련 캐시들 무효화 (방 목록에 사용자 정보가 포함됨)
+    await CacheService.invalidateRoomsListCache();
 
     res.json({
       success: true,
@@ -337,7 +357,7 @@ exports.deleteAccount = async (req, res) => {
   }
 };
 
-// 🚀 추가: 사용자 검색 기능 (lean() 최적화)
+// 🚀 Redis 캐싱: 사용자 검색 기능
 exports.searchUsers = async (req, res) => {
   try {
     const { query, page = 1, limit = 10 } = req.query;
@@ -350,28 +370,51 @@ exports.searchUsers = async (req, res) => {
       });
     }
 
+    const searchQuery = query.trim();
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+
+    // 🚀 캐시에서 먼저 확인
+    const cachedResult = await CacheService.getUserSearchResults(searchQuery, pageNum, limitNum);
+    
+    if (cachedResult) {
+      // 캐시 히트 헤더 추가
+      res.set({
+        'X-Cache': 'HIT',
+        'Cache-Control': 'private, max-age=600'
+      });
+
+      return res.json({
+        success: true,
+        ...cachedResult,
+        cached: true
+      });
+    }
+
+    // 캐시 미스 - DB에서 검색
+    console.log(`[API] Search cache miss - searching users in DB: ${searchQuery}`);
+
     // 🚀 LEAN 최적화: 사용자 검색
     const users = await User.find({
       $or: [
-        { name: { $regex: query, $options: 'i' } },
-        { email: { $regex: query, $options: 'i' } }
+        { name: { $regex: searchQuery, $options: 'i' } },
+        { email: { $regex: searchQuery, $options: 'i' } }
       ]
     })
-    .select('_id name email profileImage') // 필요한 필드만
+    .select('_id name email profileImage createdAt')
     .skip(skip)
-    .limit(parseInt(limit))
-    .lean(); // 순수 객체로 조회
+    .limit(limitNum)
+    .lean();
 
     // 총 개수 조회 (카운트만 필요하므로 더 가벼움)
     const totalCount = await User.countDocuments({
       $or: [
-        { name: { $regex: query, $options: 'i' } },
-        { email: { $regex: query, $options: 'i' } }
+        { name: { $regex: searchQuery, $options: 'i' } },
+        { email: { $regex: searchQuery, $options: 'i' } }
       ]
     });
 
-    res.json({
-      success: true,
+    const responseData = {
       users: users.map(user => ({
         id: user._id,
         name: user.name,
@@ -379,11 +422,26 @@ exports.searchUsers = async (req, res) => {
         profileImage: user.profileImage
       })),
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page: pageNum,
+        limit: limitNum,
         total: totalCount,
         hasMore: skip + users.length < totalCount
       }
+    };
+
+    // 🚀 결과를 캐시에 저장
+    await CacheService.setUserSearchResults(searchQuery, pageNum, limitNum, responseData);
+
+    // 캐시 미스 헤더 추가
+    res.set({
+      'X-Cache': 'MISS',
+      'Cache-Control': 'private, max-age=600'
+    });
+
+    res.json({
+      success: true,
+      ...responseData,
+      cached: false
     });
 
   } catch (error) {

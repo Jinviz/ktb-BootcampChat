@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const { jwtSecret } = require('../config/keys');
 const redisClient = require('../utils/redisClient');
 const SessionService = require('../services/sessionService');
+const CacheService = require('../services/cacheService');
 const audioService = require('../services/audioService');
 const aiService = require('../services/aiService');
 
@@ -348,7 +349,8 @@ module.exports = function(io) {
         return next(new Error(validationResult.message || 'Invalid session'));
       }
 
-      const user = await User.findById(decoded.user.id);
+      // 🚀 사용자 정보를 캐시에서 가져오기
+      const user = await CacheService.getUserInfo(decoded.user.id);
       if (!user) {
         return next(new Error('User not found'));
       }
@@ -804,82 +806,84 @@ module.exports = function(io) {
       }
     });
 
-    // 채팅방 퇴장 처리
-    socket.on('leaveRoom', async (roomId) => {
-      try {
-        if (!socket.user) {
-          throw new Error('Unauthorized');
-        }
+        // 채팅방 퇴장 처리
+        socket.on('leaveRoom', async (roomId) => {
+          try {
+            if (!socket.user) {
+              throw new Error('Unauthorized');
+            }
 
-        // 실제로 해당 방에 참여 중인지 먼저 확인
-        const currentRoom = userRooms?.get(socket.user.id);
-        if (!currentRoom || currentRoom !== roomId) {
-          console.log(`User ${socket.user.id} is not in room ${roomId}`);
-          return;
-        }
+            // 실제로 해당 방에 참여 중인지 먼저 확인
+            const currentRoom = userRooms?.get(socket.user.id);
+            if (!currentRoom || currentRoom !== roomId) {
+              console.log(`User ${socket.user.id} is not in room ${roomId}`);
+              return;
+            }
 
-        // 권한 확인
-        const room = await Room.findOne({
-          _id: roomId,
-          participants: socket.user.id
-        }).select('participants').lean();
+            // 🚀 캐시에서 방 정보 확인
+            const room = await CacheService.getRoomInfo(roomId);
 
-        if (!room) {
-          console.log(`Room ${roomId} not found or user has no access`);
-          return;
-        }
+            if (!room) {
+              console.log(`Room ${roomId} not found or user has no access`);
+              return;
+            }
 
-        socket.leave(roomId);
-        userRooms.delete(socket.user.id);
+            socket.leave(roomId);
+            userRooms.delete(socket.user.id);
 
-        // 퇴장 메시지 생성 및 저장
-        const leaveMessage = await Message.create({
-          room: roomId,
-          content: `${socket.user.name}님이 퇴장하였습니다.`,
-          type: 'system',
-          timestamp: new Date()
-        });
+            // 퇴장 메시지 생성 및 저장
+            const leaveMessage = await Message.create({
+              room: roomId,
+              content: `${socket.user.name}님이 퇴장하였습니다.`,
+              type: 'system',
+              timestamp: new Date()
+            });
 
-        // 참가자 목록 업데이트 - profileImage 포함
-        const updatedRoom = await Room.findByIdAndUpdate(
-          roomId,
-          { $pull: { participants: socket.user.id } },
-          { 
-            new: true,
-            runValidators: true
+            // 참가자 목록에서 사용자 제거
+            await Room.findByIdAndUpdate(
+              roomId,
+              { $pull: { participants: socket.user.id } },
+              { new: true }
+            );
+
+            // 🚀 관련 캐시 무효화
+            await Promise.all([
+              CacheService.invalidateRoomInfo(roomId),
+              CacheService.invalidateRoomParticipants(roomId),
+              CacheService.invalidateRoomsListCache(),
+              invalidateRoomCache(roomId) // 메시지 캐시도 무효화
+            ]);
+
+            // 업데이트된 참가자 목록 가져오기
+            const updatedRoom = await CacheService.getRoomInfo(roomId);
+
+            // 스트리밍 세션 정리
+            for (const [messageId, session] of streamingSessions.entries()) {
+              if (session.room === roomId && session.userId === socket.user.id) {
+                streamingSessions.delete(messageId);
+              }
+            }
+
+            // 메시지 큐 정리
+            const queueKey = `${roomId}:${socket.user.id}`;
+            messageQueues.delete(queueKey);
+            messageLoadRetries.delete(queueKey);
+
+            // 이벤트 발송
+            io.to(roomId).emit('message', leaveMessage);
+            if (updatedRoom) {
+              io.to(roomId).emit('participantsUpdate', updatedRoom.participants);
+            }
+
+            console.log(`User ${socket.user.id} left room ${roomId} successfully`);
+
+          } catch (error) {
+            console.error('Leave room error:', error);
+            socket.emit('error', {
+              message: error.message || '채팅방 퇴장 중 오류가 발생했습니다.'
+            });
           }
-        ).populate('participants', 'name email profileImage');
-
-        if (!updatedRoom) {
-          console.log(`Room ${roomId} not found during update`);
-          return;
-        }
-
-        // 스트리밍 세션 정리
-        for (const [messageId, session] of streamingSessions.entries()) {
-          if (session.room === roomId && session.userId === socket.user.id) {
-            streamingSessions.delete(messageId);
-          }
-        }
-
-        // 메시지 큐 정리
-        const queueKey = `${roomId}:${socket.user.id}`;
-        messageQueues.delete(queueKey);
-        messageLoadRetries.delete(queueKey);
-
-        // 이벤트 발송
-        io.to(roomId).emit('message', leaveMessage);
-        io.to(roomId).emit('participantsUpdate', updatedRoom.participants);
-
-        console.log(`User ${socket.user.id} left room ${roomId} successfully`);
-
-      } catch (error) {
-        console.error('Leave room error:', error);
-        socket.emit('error', {
-          message: error.message || '채팅방 퇴장 중 오류가 발생했습니다.'
         });
-      }
-    });
     
     // 연결 해제 처리
     socket.on('disconnect', async (reason) => {
