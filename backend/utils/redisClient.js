@@ -61,6 +61,8 @@ class MockRedisClient {
 class RedisClient {
   constructor() {
     this.client = null;
+    this.publisher = null;
+    this.subscriber = null;
     this.isConnected = false;
     this.connectionAttempts = 0;
     this.maxRetries = 3;
@@ -76,15 +78,128 @@ class RedisClient {
 
     try {
       await this.connect();
+      await this.setupPubSubClients();
       this.initialized = true;
       return this.client;
     } catch (error) {
       console.warn('Redis initialization failed, using mock client:', error.message);
       this.client = new MockRedisClient();
+      this.publisher = new MockRedisClient();
+      this.subscriber = new MockRedisClient();
       this.isConnected = true;
       this.useMock = true;
       this.initialized = true;
       return this.client;
+    }
+  }
+
+  async setupPubSubClients() {
+    if (this.useMock) return;
+
+    try {
+      if (redisHost.includes(',')) {
+        // Cluster 모드
+        const redisHosts = redisHost.split(',').map(host => {
+          return { host: host.trim(), port: parseInt(redisPort) };
+        });
+
+        // Publisher 클라이언트 (명령어 전용) - 고성능 설정
+        this.publisher = new Redis.Cluster(redisHosts, {
+          redisOptions: {
+            connectTimeout: 2000,      // 더 빠른 연결
+            commandTimeout: 1500,      // 더 빠른 명령어 실행
+            retryDelayOnFailover: 25,  
+            maxRetriesPerRequest: 3,   // 재시도 줄임
+            enableOfflineQueue: false,
+            family: 4,
+            keepAlive: true,
+            enableAutoPipelining: true, // 파이프라이닝으로 성능 향상
+            lazyConnect: false
+          },
+          enableOfflineQueue: false,
+          retryDelayOnFailover: 25,
+          retryDelayOnClusterDown: 200,
+          maxRetriesPerRequest: 3,   // 빠른 실패
+          scaleReads: 'master',      // Publisher는 master만 사용
+          lazyConnect: false,
+          
+          // 고성능 클러스터 설정
+          slotsRefreshTimeout: 500,
+          slotsRefreshInterval: 3000,
+          enableReadyCheck: false
+        });
+
+        // Subscriber 클라이언트 (구독 전용) - 안정성 우선
+        this.subscriber = new Redis.Cluster(redisHosts, {
+          redisOptions: {
+            connectTimeout: 3000,
+            commandTimeout: 2000,
+            retryDelayOnFailover: 50,
+            maxRetriesPerRequest: 5,   // 구독은 안정성 우선
+            enableOfflineQueue: false,
+            family: 4,
+            keepAlive: true,
+            enableAutoPipelining: false, // 구독에는 파이프라이닝 비활성화
+            lazyConnect: false
+          },
+          enableOfflineQueue: false,
+          retryDelayOnFailover: 50,
+          retryDelayOnClusterDown: 300,
+          maxRetriesPerRequest: 5,
+          scaleReads: 'slave',       // Subscriber는 slave 사용 가능
+          lazyConnect: false,
+          
+          // 안정성 우선 설정
+          slotsRefreshTimeout: 1000,
+          slotsRefreshInterval: 5000
+        });
+
+      } else {
+        // Single Redis 모드
+        this.publisher = new Redis({
+          host: redisHost,
+          port: redisPort,
+          connectTimeout: 2000,
+          commandTimeout: 2000,
+          retryDelayOnFailover: 100,
+          maxRetriesPerRequest: 2,
+          lazyConnect: false
+        });
+
+        this.subscriber = new Redis({
+          host: redisHost,
+          port: redisPort,
+          connectTimeout: 2000,
+          commandTimeout: 2000,
+          retryDelayOnFailover: 100,
+          maxRetriesPerRequest: 2,
+          lazyConnect: false
+        });
+      }
+
+      // Publisher 이벤트 핸들러
+      this.publisher.on('connect', () => {
+        console.log('Redis Publisher connected');
+      });
+
+      this.publisher.on('error', (err) => {
+        console.error('Redis Publisher error:', err.message);
+      });
+
+      // Subscriber 이벤트 핸들러
+      this.subscriber.on('connect', () => {
+        console.log('Redis Subscriber connected');
+      });
+
+      this.subscriber.on('error', (err) => {
+        console.error('Redis Subscriber error:', err.message);
+      });
+
+      console.log('Redis Pub/Sub clients initialized successfully');
+
+    } catch (error) {
+      console.error('Redis Pub/Sub setup failed:', error);
+      throw error;
     }
   }
 
@@ -117,20 +232,33 @@ class RedisClient {
 
         this.client = new Redis.Cluster(redisHosts, {
           redisOptions: {
-            connectTimeout: 10000,     // 10초로 증가
-            commandTimeout: 10000,     // 10초로 증가
-            retryDelayOnFailover: 100, // 빠른 재시도
-            maxRetriesPerRequest: 10,  // 리디렉션 재시도 증가
+            connectTimeout: 3000,      // 10초 → 3초로 단축
+            commandTimeout: 2000,      // 10초 → 2초로 단축  
+            retryDelayOnFailover: 25,  // 100ms → 25ms로 단축
+            maxRetriesPerRequest: 5,   // 10 → 5로 줄임 (중요!)
+            enableOfflineQueue: false, // 성능 최적화
+            family: 4,
+            keepAlive: true,
+            lazyConnect: false,        // 즉시 연결
+            
+            // 클러스터 최적화 설정
+            enableReadyCheck: false,   // 빠른 시작
+            maxLoadBalancingConnectionAttempts: 3
           },
-          enableOfflineQueue: true,
-          retryDelayOnFailover: 100,    // 빠른 재시도
-          retryDelayOnClusterDown: 1000,
-          maxRetriesPerRequest: 10,     // 리디렉션 재시도 증가
+          enableOfflineQueue: false,   // 큐 비활성화
+          retryDelayOnFailover: 25,    // 100ms → 25ms로 단축
+          retryDelayOnClusterDown: 300, // 1000ms → 300ms로 단축
+          maxRetriesPerRequest: 5,     // 10 → 5로 줄임
           scaleReads: 'slave',
-          clusterRetryDelayOnClusterDown: 1000,
-          clusterRetryDelayOnFailover: 100,  // 빠른 재시도
-          enableReadyCheck: true,       // 클러스터 준비 상태 확인
-          lazyConnect: true
+          clusterRetryDelayOnClusterDown: 300,
+          clusterRetryDelayOnFailover: 25,
+          enableReadyCheck: false,     // 빠른 시작
+          lazyConnect: false,          // 즉시 연결
+          
+          // 클러스터 토폴로지 최적화
+          slotsRefreshTimeout: 1000,   // 슬롯 새로고침 1초
+          slotsRefreshInterval: 5000,  // 5초마다 새로고침
+          maxRetriesPerRequest: 5      // 명시적 설정
         });
 
         this.client.on('connect', () => {
@@ -314,17 +442,116 @@ class RedisClient {
     }
   }
 
-  async quit() {
-    if (this.client) {
+  // Publisher 전용 메서드
+  async getPublisher() {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+    return this.publisher || this.client;
+  }
+
+  // Subscriber 전용 메서드
+  async getSubscriber() {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+    return this.subscriber || this.client;
+  }
+
+  // Pub/Sub 발행 (배치 처리 지원)
+  async publish(channel, message) {
+    try {
+      const publisher = await this.getPublisher();
+      const result = await publisher.publish(channel, message);
+      return result;
+    } catch (error) {
+      console.error('Redis publish error:', error);
+      throw error;
+    }
+  }
+
+  // 배치 Hash 연산 (성능 최적화)
+  async batchHashOperations(operations) {
+    try {
+      const client = await this.ensureConnection();
+      const pipeline = client.pipeline();
+      
+      operations.forEach(op => {
+        switch (op.type) {
+          case 'hset':
+            pipeline.hset(op.key, op.field, op.value);
+            break;
+          case 'hget':
+            pipeline.hget(op.key, op.field);
+            break;
+          case 'hdel':
+            pipeline.hdel(op.key, op.field);
+            break;
+        }
+      });
+      
+      const results = await pipeline.exec();
+      return results;
+    } catch (error) {
+      console.error('Redis batch hash operations error:', error);
+      throw error;
+    }
+  }
+
+  // Hash 연산 최적화 (hset)
+  async hset(key, field, value) {
+    try {
+      const client = await this.ensureConnection();
+      const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+      return await client.hset(key, field, stringValue);
+    } catch (error) {
+      console.error('Redis hset error:', error);
+      throw error;
+    }
+  }
+
+  // Hash 연산 최적화 (hget)
+  async hget(key, field) {
+    try {
+      const client = await this.ensureConnection();
+      const value = await client.hget(key, field);
+      if (!value) return null;
+      
       try {
-        await this.client.quit();
-        this.isConnected = false;
-        this.client = null;
-        this.initialized = false;
-        console.log('Redis connection closed successfully');
-      } catch (error) {
-        console.error('Redis quit error:', error);
+        return JSON.parse(value);
+      } catch (parseError) {
+        return value;
       }
+    } catch (error) {
+      console.error('Redis hget error:', error);
+      throw error;
+    }
+  }
+
+  // Hash 연산 최적화 (hdel)
+  async hdel(key, field) {
+    try {
+      const client = await this.ensureConnection();
+      return await client.hdel(key, field);
+    } catch (error) {
+      console.error('Redis hdel error:', error);
+      throw error;
+    }
+  }
+
+  // Pub/Sub 구독
+  async subscribe(channels) {
+    try {
+      const subscriber = await this.getSubscriber();
+      if (Array.isArray(channels)) {
+        await subscriber.subscribe(...channels);
+      } else {
+        await subscriber.subscribe(channels);
+      }
+      return subscriber;
+    } catch (error) {
+      console.error('Redis subscribe error:', error);
+      throw error;
     }
   }
 }

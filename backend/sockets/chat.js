@@ -29,13 +29,13 @@ module.exports = function(io) {
     
     async setupSubscriptions() {
       try {
-        const subscriber = await redisClient.ensureConnection();
-        
-        // 사용자 로그인 알림 구독
-        await subscriber.subscribe('user:login');
-        await subscriber.subscribe('user:logout'); 
-        await subscriber.subscribe('user:room:join');
-        await subscriber.subscribe('user:room:leave');
+        const subscriber = await redisClient.subscribe([
+          'user:login',
+          'user:logout', 
+          'user:room:join',
+          'user:room:leave',
+          'message:broadcast'
+        ]);
         
         subscriber.on('message', (channel, message) => {
           try {
@@ -56,6 +56,9 @@ module.exports = function(io) {
                 break;
               case 'user:room:leave':
                 this.handleRemoteRoomLeave(data);
+                break;
+              case 'message:broadcast':
+                this.handleRemoteMessageBroadcast(data);
                 break;
             }
           } catch (error) {
@@ -108,26 +111,49 @@ module.exports = function(io) {
       console.log(`[${INSTANCE_ID}] Remote room join: ${userId} joined ${roomId} on ${instanceId}`);
     }
     
-    // 원격 방 퇴장 처리
-    handleRemoteRoomLeave(data) {
-      const { userId, roomId, instanceId } = data;
-      console.log(`[${INSTANCE_ID}] Remote room leave: ${userId} left ${roomId} on ${instanceId}`);
+    // 원격 메시지 브로드캐스트 처리
+    handleRemoteMessageBroadcast(data) {
+      const { roomId, messageData, eventType } = data;
+      console.log(`[${INSTANCE_ID}] Remote message broadcast: ${eventType} in room ${roomId}`);
+      
+      try {
+        switch (eventType) {
+          case 'message':
+            io.to(roomId).emit('message', messageData);
+            break;
+          case 'aiMessageStart':
+            io.to(roomId).emit('aiMessageStart', messageData);
+            break;
+          case 'aiMessageChunk':
+            io.to(roomId).emit('aiMessageChunk', messageData);
+            break;
+          case 'aiMessageComplete':
+            io.to(roomId).emit('aiMessageComplete', messageData);
+            break;
+          case 'aiMessageError':
+            io.to(roomId).emit('aiMessageError', messageData);
+            break;
+          case 'participantsUpdate':
+            io.to(roomId).emit('participantsUpdate', messageData);
+            break;
+        }
+      } catch (error) {
+        console.error('Remote message broadcast error:', error);
+      }
     }
     
     // 사용자 로그인 알림 발행
     async notifyUserLogin(userId, socketId) {
       try {
-        const publisher = await redisClient.ensureConnection();
-        
-        // Redis Hash에 사용자 상태 저장
-        await publisher.hset('connected_users', userId, JSON.stringify({
+        // Redis Hash에 사용자 상태 저장 (최적화된 메서드 사용)
+        await redisClient.hset('connected_users', userId, {
           socketId,
           instanceId: INSTANCE_ID,
           timestamp: Date.now()
-        }));
+        });
         
         // 다른 인스턴스들에게 알림
-        await publisher.publish('user:login', JSON.stringify({
+        await redisClient.publish('user:login', JSON.stringify({
           userId,
           socketId,
           instanceId: INSTANCE_ID,
@@ -143,13 +169,11 @@ module.exports = function(io) {
     // 사용자 로그아웃 알림 발행
     async notifyUserLogout(userId) {
       try {
-        const publisher = await redisClient.ensureConnection();
-        
-        // Redis Hash에서 사용자 상태 제거
-        await publisher.hdel('connected_users', userId);
+        // Redis Hash에서 사용자 상태 제거 (최적화된 메서드 사용)
+        await redisClient.hdel('connected_users', userId);
         
         // 다른 인스턴스들에게 알림
-        await publisher.publish('user:logout', JSON.stringify({
+        await redisClient.publish('user:logout', JSON.stringify({
           userId,
           instanceId: INSTANCE_ID,
           timestamp: Date.now()
@@ -164,13 +188,11 @@ module.exports = function(io) {
     // 방 입장 알림 발행
     async notifyRoomJoin(userId, roomId) {
       try {
-        const publisher = await redisClient.ensureConnection();
-        
-        // Redis Hash에 사용자-방 매핑 저장
-        await publisher.hset('user_rooms', userId, roomId);
+        // Redis Hash에 사용자-방 매핑 저장 (최적화된 메서드 사용)
+        await redisClient.hset('user_rooms', userId, roomId);
         
         // 다른 인스턴스들에게 알림
-        await publisher.publish('user:room:join', JSON.stringify({
+        await redisClient.publish('user:room:join', JSON.stringify({
           userId,
           roomId,
           instanceId: INSTANCE_ID,
@@ -186,13 +208,11 @@ module.exports = function(io) {
     // 방 퇴장 알림 발행
     async notifyRoomLeave(userId, roomId) {
       try {
-        const publisher = await redisClient.ensureConnection();
-        
-        // Redis Hash에서 사용자-방 매핑 제거
-        await publisher.hdel('user_rooms', userId);
+        // Redis Hash에서 사용자-방 매핑 제거 (최적화된 메서드 사용)
+        await redisClient.hdel('user_rooms', userId);
         
         // 다른 인스턴스들에게 알림
-        await publisher.publish('user:room:leave', JSON.stringify({
+        await redisClient.publish('user:room:leave', JSON.stringify({
           userId,
           roomId,
           instanceId: INSTANCE_ID,
@@ -205,16 +225,56 @@ module.exports = function(io) {
       }
     }
     
+    // 메시지 브로드캐스트 (중복 제거용)
+    async broadcastMessage(roomId, eventType, messageData, isOriginator = true) {
+      try {
+        if (isOriginator) {
+          // 자신의 인스턴스에서 직접 브로드캐스트
+          switch (eventType) {
+            case 'message':
+              io.to(roomId).emit('message', messageData);
+              break;
+            case 'aiMessageStart':
+              io.to(roomId).emit('aiMessageStart', messageData);
+              break;
+            case 'aiMessageChunk':
+              io.to(roomId).emit('aiMessageChunk', messageData);
+              break;
+            case 'aiMessageComplete':
+              io.to(roomId).emit('aiMessageComplete', messageData);
+              break;
+            case 'aiMessageError':
+              io.to(roomId).emit('aiMessageError', messageData);
+              break;
+            case 'participantsUpdate':
+              io.to(roomId).emit('participantsUpdate', messageData);
+              break;
+          }
+          
+          // 다른 인스턴스들에게 브로드캐스트 알림
+          await redisClient.publish('message:broadcast', JSON.stringify({
+            roomId,
+            eventType,
+            messageData,
+            instanceId: INSTANCE_ID,
+            timestamp: Date.now()
+          }));
+          
+          console.log(`[${INSTANCE_ID}] Broadcasted ${eventType} to room ${roomId}`);
+        }
+      } catch (error) {
+        console.error('Broadcast message error:', error);
+      }
+    }
+    
     // 전역 중복 로그인 체크
     async checkGlobalDuplicateLogin(userId) {
       try {
-        const publisher = await redisClient.ensureConnection();
-        const existingUser = await publisher.hget('connected_users', userId);
+        const existingUser = await redisClient.hget('connected_users', userId);
         
         if (existingUser) {
-          const userData = JSON.parse(existingUser);
-          console.log(`[${INSTANCE_ID}] Global duplicate login detected for ${userId}: ${userData.instanceId}`);
-          return userData;
+          console.log(`[${INSTANCE_ID}] Global duplicate login detected for ${userId}: ${existingUser.instanceId}`);
+          return existingUser;
         }
         
         return null;
@@ -886,7 +946,7 @@ module.exports = function(io) {
             });
             
             await joinMessage.save();
-            io.to(roomId).emit('message', joinMessage);
+            await distributedState.broadcastMessage(roomId, 'message', joinMessage, true);
             
             // 캐시 무효화 (새 메시지 추가됨)
             await invalidateRoomCache(roomId);
@@ -895,7 +955,7 @@ module.exports = function(io) {
           }
         });
 
-        io.to(roomId).emit('participantsUpdate', room.participants);
+        await distributedState.broadcastMessage(roomId, 'participantsUpdate', room.participants, true);
 
       } catch (error) {
         console.error('Join room error:', error);
@@ -1044,7 +1104,8 @@ module.exports = function(io) {
           { path: 'file', select: 'filename originalname mimetype size' }
         ]);
 
-        io.to(room).emit('message', message);
+        // 중복 제거를 위한 브로드캐스트
+        await distributedState.broadcastMessage(room, 'message', message, true);
 
         // 캐시 업데이트 (무효화 대신 새 메시지 추가)
         await updateCacheWithNewMessage(room, message);
@@ -1142,9 +1203,9 @@ module.exports = function(io) {
             queueTimestamps.delete(queueKey);
 
             // 이벤트 발송
-            io.to(roomId).emit('message', leaveMessage);
+            await distributedState.broadcastMessage(roomId, 'message', leaveMessage, true);
             if (updatedRoom) {
-              io.to(roomId).emit('participantsUpdate', updatedRoom.participants);
+              await distributedState.broadcastMessage(roomId, 'participantsUpdate', updatedRoom.participants, true);
             }
 
             console.log(`User ${socket.user.id} left room ${roomId} successfully`);
@@ -1492,11 +1553,11 @@ module.exports = function(io) {
     });
 
     // 초기 상태 전송
-    io.to(room).emit('aiMessageStart', {
+    await distributedState.broadcastMessage(room, 'aiMessageStart', {
       messageId,
       aiType: aiName,
       timestamp
-    });
+    }, true);
 
     try {
       // AI 응답 생성 및 스트리밍
@@ -1516,7 +1577,7 @@ module.exports = function(io) {
             session.lastUpdate = Date.now();
           }
 
-          io.to(room).emit('aiMessageChunk', {
+          await distributedState.broadcastMessage(room, 'aiMessageChunk', {
             messageId,
             currentChunk: chunk.currentChunk,
             fullContent: accumulatedContent,
@@ -1524,7 +1585,7 @@ module.exports = function(io) {
             timestamp: new Date(),
             aiType: aiName,
             isComplete: false
-          });
+          }, true);
         },
         onComplete: async (finalContent) => {
           // 스트리밍 세션 정리
@@ -1547,7 +1608,7 @@ module.exports = function(io) {
           });
 
           // 완료 메시지 전송
-          io.to(room).emit('aiMessageComplete', {
+          await distributedState.broadcastMessage(room, 'aiMessageComplete', {
             messageId,
             _id: aiMessage._id,
             content: finalContent.content,
@@ -1556,7 +1617,7 @@ module.exports = function(io) {
             isComplete: true,
             query,
             reactions: {}
-          });
+          }, true);
 
           logDebug('AI response completed', {
             messageId,
@@ -1569,11 +1630,11 @@ module.exports = function(io) {
           streamingSessions.delete(messageId);
           console.error('AI response error:', error);
           
-          io.to(room).emit('aiMessageError', {
+          await distributedState.broadcastMessage(room, 'aiMessageError', {
             messageId,
             error: error.message || 'AI 응답 생성 중 오류가 발생했습니다.',
             aiType: aiName
-          });
+          }, true);
 
           logDebug('AI response error', {
             messageId,
@@ -1586,11 +1647,11 @@ module.exports = function(io) {
       streamingSessions.delete(messageId);
       console.error('AI service error:', error);
       
-      io.to(room).emit('aiMessageError', {
+      await distributedState.broadcastMessage(room, 'aiMessageError', {
         messageId,
         error: error.message || 'AI 서비스 오류가 발생했습니다.',
         aiType: aiName
-      });
+      }, true);
 
       logDebug('AI service error', {
         messageId,
