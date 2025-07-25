@@ -1626,7 +1626,7 @@ module.exports = function(io) {
             generationTime: Date.now() - timestamp
           });
         },
-        onError: (error) => {
+        onError: async (error) => {
           streamingSessions.delete(messageId);
           console.error('AI response error:', error);
           

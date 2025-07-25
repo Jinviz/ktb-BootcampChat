@@ -556,5 +556,90 @@ class RedisClient {
   }
 }
 
+// Publisher 전용 메서드
+RedisClient.prototype.getPublisher = async function() {
+  if (!this.initialized) {
+    await this.initialize();
+  }
+  return this.publisher || this.client;
+};
+
+// Subscriber 전용 메서드
+RedisClient.prototype.getSubscriber = async function() {
+  if (!this.initialized) {
+    await this.initialize();
+  }
+  return this.subscriber || this.client;
+};
+
+// Pub/Sub 발행
+RedisClient.prototype.publish = async function(channel, message) {
+  try {
+    const publisher = await this.getPublisher();
+    const result = await publisher.publish(channel, message);
+    return result;
+  } catch (error) {
+    console.error('Redis publish error:', error);
+    throw error;
+  }
+};
+
+// Hash 연산 최적화 (hset)
+RedisClient.prototype.hset = async function(key, field, value) {
+  try {
+    const client = await this.ensureConnection();
+    const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    return await client.hset(key, field, stringValue);
+  } catch (error) {
+    console.error('Redis hset error:', error);
+    throw error;
+  }
+};
+
+// Hash 연산 최적화 (hget)
+RedisClient.prototype.hget = async function(key, field) {
+  try {
+    const client = await this.ensureConnection();
+    const value = await client.hget(key, field);
+    if (!value) return null;
+    
+    try {
+      return JSON.parse(value);
+    } catch (parseError) {
+      return value;
+    }
+  } catch (error) {
+    console.error('Redis hget error:', error);
+    throw error;
+  }
+};
+
+// Hash 연산 최적화 (hdel)
+RedisClient.prototype.hdel = async function(key, field) {
+  try {
+    const client = await this.ensureConnection();
+    return await client.hdel(key, field);
+  } catch (error) {
+    console.error('Redis hdel error:', error);
+    throw error;
+  }
+};
+
+// Pub/Sub 구독
+RedisClient.prototype.subscribe = async function(channels) {
+  try {
+    const subscriber = await this.getSubscriber();
+    if (Array.isArray(channels)) {
+      await subscriber.subscribe(...channels);
+    } else {
+      await subscriber.subscribe(channels);
+    }
+    return subscriber;
+  } catch (error) {
+    console.error('Redis subscribe error:', error);
+    throw error;
+  }
+};
+
 const redisClient = new RedisClient();
 module.exports = redisClient;
