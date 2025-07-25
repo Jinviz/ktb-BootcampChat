@@ -17,6 +17,216 @@ module.exports = function(io) {
   const messageQueues = new Map();
   const messageLoadRetries = new Map();
   const queueTimestamps = new Map(); // 큐 생성 시간 추적용
+  
+  // 인스턴스 ID 생성 (환경변수 또는 랜덤)
+  const INSTANCE_ID = process.env.INSTANCE_ID || `instance-${Math.random().toString(36).substr(2, 9)}`;
+  
+  // Redis Pub/Sub을 위한 분산 상태 관리 클래스
+  class DistributedState {
+    constructor() {
+      this.setupSubscriptions();
+    }
+    
+    async setupSubscriptions() {
+      try {
+        const subscriber = await redisClient.ensureConnection();
+        
+        // 사용자 로그인 알림 구독
+        await subscriber.subscribe('user:login');
+        await subscriber.subscribe('user:logout'); 
+        await subscriber.subscribe('user:room:join');
+        await subscriber.subscribe('user:room:leave');
+        
+        subscriber.on('message', (channel, message) => {
+          try {
+            const data = JSON.parse(message);
+            
+            // 자신의 인스턴스에서 발생한 이벤트는 무시
+            if (data.instanceId === INSTANCE_ID) return;
+            
+            switch (channel) {
+              case 'user:login':
+                this.handleRemoteUserLogin(data);
+                break;
+              case 'user:logout':
+                this.handleRemoteUserLogout(data);
+                break;
+              case 'user:room:join':
+                this.handleRemoteRoomJoin(data);
+                break;
+              case 'user:room:leave':
+                this.handleRemoteRoomLeave(data);
+                break;
+            }
+          } catch (error) {
+            console.error('Pub/Sub message parsing error:', error);
+          }
+        });
+        
+        console.log(`[${INSTANCE_ID}] Redis Pub/Sub subscriptions established`);
+      } catch (error) {
+        console.error('Redis Pub/Sub setup error:', error);
+      }
+    }
+    
+    // 원격 사용자 로그인 처리
+    handleRemoteUserLogin(data) {
+      const { userId, socketId, instanceId } = data;
+      console.log(`[${INSTANCE_ID}] Remote user login detected: ${userId} on ${instanceId}`);
+      
+      // 로컬에 연결된 같은 사용자가 있다면 중복 로그인 처리
+      const localSocketId = connectedUsers.get(userId);
+      if (localSocketId) {
+        const localSocket = io.sockets.sockets.get(localSocketId);
+        if (localSocket) {
+          localSocket.emit('duplicate_login', {
+            type: 'remote_login_detected',
+            instanceId: instanceId,
+            timestamp: Date.now()
+          });
+          
+          setTimeout(() => {
+            localSocket.emit('session_ended', {
+              reason: 'duplicate_login',
+              message: '다른 기기에서 로그인하여 현재 세션이 종료되었습니다.'
+            });
+            localSocket.disconnect(true);
+          }, 5000);
+        }
+      }
+    }
+    
+    // 원격 사용자 로그아웃 처리
+    handleRemoteUserLogout(data) {
+      const { userId, instanceId } = data;
+      console.log(`[${INSTANCE_ID}] Remote user logout detected: ${userId} from ${instanceId}`);
+    }
+    
+    // 원격 방 입장 처리
+    handleRemoteRoomJoin(data) {
+      const { userId, roomId, instanceId } = data;
+      console.log(`[${INSTANCE_ID}] Remote room join: ${userId} joined ${roomId} on ${instanceId}`);
+    }
+    
+    // 원격 방 퇴장 처리
+    handleRemoteRoomLeave(data) {
+      const { userId, roomId, instanceId } = data;
+      console.log(`[${INSTANCE_ID}] Remote room leave: ${userId} left ${roomId} on ${instanceId}`);
+    }
+    
+    // 사용자 로그인 알림 발행
+    async notifyUserLogin(userId, socketId) {
+      try {
+        const publisher = await redisClient.ensureConnection();
+        
+        // Redis Hash에 사용자 상태 저장
+        await publisher.hset('connected_users', userId, JSON.stringify({
+          socketId,
+          instanceId: INSTANCE_ID,
+          timestamp: Date.now()
+        }));
+        
+        // 다른 인스턴스들에게 알림
+        await publisher.publish('user:login', JSON.stringify({
+          userId,
+          socketId,
+          instanceId: INSTANCE_ID,
+          timestamp: Date.now()
+        }));
+        
+        console.log(`[${INSTANCE_ID}] Published user login: ${userId}`);
+      } catch (error) {
+        console.error('Notify user login error:', error);
+      }
+    }
+    
+    // 사용자 로그아웃 알림 발행
+    async notifyUserLogout(userId) {
+      try {
+        const publisher = await redisClient.ensureConnection();
+        
+        // Redis Hash에서 사용자 상태 제거
+        await publisher.hdel('connected_users', userId);
+        
+        // 다른 인스턴스들에게 알림
+        await publisher.publish('user:logout', JSON.stringify({
+          userId,
+          instanceId: INSTANCE_ID,
+          timestamp: Date.now()
+        }));
+        
+        console.log(`[${INSTANCE_ID}] Published user logout: ${userId}`);
+      } catch (error) {
+        console.error('Notify user logout error:', error);
+      }
+    }
+    
+    // 방 입장 알림 발행
+    async notifyRoomJoin(userId, roomId) {
+      try {
+        const publisher = await redisClient.ensureConnection();
+        
+        // Redis Hash에 사용자-방 매핑 저장
+        await publisher.hset('user_rooms', userId, roomId);
+        
+        // 다른 인스턴스들에게 알림
+        await publisher.publish('user:room:join', JSON.stringify({
+          userId,
+          roomId,
+          instanceId: INSTANCE_ID,
+          timestamp: Date.now()
+        }));
+        
+        console.log(`[${INSTANCE_ID}] Published room join: ${userId} -> ${roomId}`);
+      } catch (error) {
+        console.error('Notify room join error:', error);
+      }
+    }
+    
+    // 방 퇴장 알림 발행
+    async notifyRoomLeave(userId, roomId) {
+      try {
+        const publisher = await redisClient.ensureConnection();
+        
+        // Redis Hash에서 사용자-방 매핑 제거
+        await publisher.hdel('user_rooms', userId);
+        
+        // 다른 인스턴스들에게 알림
+        await publisher.publish('user:room:leave', JSON.stringify({
+          userId,
+          roomId,
+          instanceId: INSTANCE_ID,
+          timestamp: Date.now()
+        }));
+        
+        console.log(`[${INSTANCE_ID}] Published room leave: ${userId} -> ${roomId}`);
+      } catch (error) {
+        console.error('Notify room leave error:', error);
+      }
+    }
+    
+    // 전역 중복 로그인 체크
+    async checkGlobalDuplicateLogin(userId) {
+      try {
+        const publisher = await redisClient.ensureConnection();
+        const existingUser = await publisher.hget('connected_users', userId);
+        
+        if (existingUser) {
+          const userData = JSON.parse(existingUser);
+          console.log(`[${INSTANCE_ID}] Global duplicate login detected for ${userId}: ${userData.instanceId}`);
+          return userData;
+        }
+        
+        return null;
+      } catch (error) {
+        console.error('Check global duplicate login error:', error);
+        return null;
+      }
+    }
+  }
+  
+  // 분산 상태 관리 인스턴스 생성
+  const distributedState = new DistributedState();
   const BATCH_SIZE = 15;  // 한 번에 로드할 메시지 수 (30 → 15)
   const LOAD_DELAY = 100; // 메시지 로드 딜레이 (300ms → 100ms)
   const MAX_RETRIES = 3;  // 최대 재시도 횟수
@@ -413,36 +623,61 @@ module.exports = function(io) {
     logDebug('socket connected', {
       socketId: socket.id,
       userId: socket.user?.id,
-      userName: socket.user?.name
+      userName: socket.user?.name,
+      instanceId: INSTANCE_ID
     });
 
     if (socket.user) {
-      // 이전 연결이 있는지 확인
-      const previousSocketId = connectedUsers.get(socket.user.id);
-      if (previousSocketId && previousSocketId !== socket.id) {
-        const previousSocket = io.sockets.sockets.get(previousSocketId);
-        if (previousSocket) {
-          // 이전 연결에 중복 로그인 알림
-          previousSocket.emit('duplicate_login', {
-            type: 'new_login_attempt',
-            deviceInfo: socket.handshake.headers['user-agent'],
-            ipAddress: socket.handshake.address,
+      // 전역 중복 로그인 체크
+      distributedState.checkGlobalDuplicateLogin(socket.user.id).then(existingUser => {
+        if (existingUser && existingUser.instanceId !== INSTANCE_ID) {
+          // 다른 인스턴스에 연결된 사용자가 있음
+          socket.emit('duplicate_login', {
+            type: 'existing_session_detected',
+            existingInstance: existingUser.instanceId,
             timestamp: Date.now()
           });
-
-          // 이전 연결 종료 처리
+          
           setTimeout(() => {
-            previousSocket.emit('session_ended', {
+            socket.emit('session_ended', {
               reason: 'duplicate_login',
-              message: '다른 기기에서 로그인하여 현재 세션이 종료되었습니다.'
+              message: '이미 다른 기기에서 로그인되어 있습니다.'
             });
-            previousSocket.disconnect(true);
-          }, DUPLICATE_LOGIN_TIMEOUT);
+            socket.disconnect(true);
+          }, 5000);
+          return;
         }
-      }
-      
-      // 새로운 연결 정보 저장
-      connectedUsers.set(socket.user.id, socket.id);
+        
+        // 로컬 중복 로그인 체크
+        const previousSocketId = connectedUsers.get(socket.user.id);
+        if (previousSocketId && previousSocketId !== socket.id) {
+          const previousSocket = io.sockets.sockets.get(previousSocketId);
+          if (previousSocket) {
+            // 이전 연결에 중복 로그인 알림
+            previousSocket.emit('duplicate_login', {
+              type: 'new_login_attempt',
+              deviceInfo: socket.handshake.headers['user-agent'],
+              ipAddress: socket.handshake.address,
+              timestamp: Date.now()
+            });
+
+            // 이전 연결 종료 처리
+            setTimeout(() => {
+              previousSocket.emit('session_ended', {
+                reason: 'duplicate_login',
+                message: '다른 기기에서 로그인하여 현재 세션이 종료되었습니다.'
+              });
+              previousSocket.disconnect(true);
+            }, DUPLICATE_LOGIN_TIMEOUT);
+          }
+        }
+        
+        // 새로운 연결 정보 저장 (로컬 + 분산)
+        connectedUsers.set(socket.user.id, socket.id);
+        
+        // Redis Pub/Sub으로 다른 인스턴스들에게 알림
+        distributedState.notifyUserLogin(socket.user.id, socket.id);
+      });
     }
 
     // 이전 메시지 로딩 처리 개선
@@ -562,6 +797,9 @@ module.exports = function(io) {
 
         socket.join(roomId);
         userRooms.set(socket.user.id, roomId);
+
+        // Redis Pub/Sub으로 방 입장 알림
+        await distributedState.notifyRoomJoin(socket.user.id, roomId);
 
         // 1단계: 즉시 입장 성공 응답 (캐시 확인)
         const cachedMessages = await getCachedRecentMessages(roomId);
@@ -861,6 +1099,9 @@ module.exports = function(io) {
             socket.leave(roomId);
             userRooms.delete(socket.user.id);
 
+            // Redis Pub/Sub으로 방 퇴장 알림
+            await distributedState.notifyRoomLeave(socket.user.id, roomId);
+
             // 퇴장 메시지 생성 및 저장
             const leaveMessage = await Message.create({
               room: roomId,
@@ -924,10 +1165,18 @@ module.exports = function(io) {
         // 해당 사용자의 현재 활성 연결인 경우에만 정리
         if (connectedUsers.get(socket.user.id) === socket.id) {
           connectedUsers.delete(socket.user.id);
+          
+          // Redis Pub/Sub으로 로그아웃 알림
+          await distributedState.notifyUserLogout(socket.user.id);
         }
 
         const roomId = userRooms.get(socket.user.id);
-        userRooms.delete(socket.user.id);
+        if (roomId) {
+          userRooms.delete(socket.user.id);
+          
+          // Redis Pub/Sub으로 방 퇴장 알림
+          await distributedState.notifyRoomLeave(socket.user.id, roomId);
+        }
 
         // 메시지 큐 정리
         const userQueues = Array.from(messageQueues.keys())
@@ -996,6 +1245,8 @@ module.exports = function(io) {
         }
 
         // 세션 종료 처리
+        await distributedState.notifyUserLogout(socket.user.id);
+        
         socket.emit('session_ended', {
           reason: 'force_logout',
           message: '다른 기기에서 로그인하여 현재 세션이 종료되었습니다.'

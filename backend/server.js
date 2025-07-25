@@ -118,12 +118,12 @@ app.use((err, req, res, next) => {
 
 // 서버 시작
 mongoose.connect(process.env.MONGO_URI, {
-  maxPoolSize: 50,        // 최대 연결 수 증가 (기본 10 → 100)
+  maxPoolSize: 100,        // 최대 연결 수 증가 (기본 10 → 100)
   serverSelectionTimeoutMS: 5000,
   socketTimeoutMS: 60000,  // Socket 타임아웃 증가
   bufferMaxEntries: 0,
   maxIdleTimeMS: 30000,
-  minPoolSize: 10,         // 최소 연결 수 유지
+  minPoolSize: 30,         // 최소 연결 수 유지
   maxConnecting: 20        // 동시 연결 시도 수 증가
 })
 .then(() => {
