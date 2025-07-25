@@ -194,33 +194,77 @@ class CacheService {
 
   static async invalidateRoomsListCache() {
     try {
-      // 간단한 패턴 매칭으로 방 목록 캐시 무효화
-      // 실제로는 Redis SCAN 또는 키 태깅을 사용하는 것이 좋음
-      const patterns = [
-        'rooms:list:0:', 'rooms:list:1:', 'rooms:list:2:', 'rooms:list:3:', 'rooms:list:4:',
-        'rooms:list:5:', 'rooms:list:6:', 'rooms:list:7:', 'rooms:list:8:', 'rooms:list:9:'
-      ];
+      console.log('[Cache] Starting room list cache invalidation...');
       
-      const sortFields = ['createdAt', 'name', 'participantsCount'];
-      const sortOrders = ['asc', 'desc'];
-      const searchTerms = ['all', '']; // 검색 없음과 빈 검색
+      // Redis SCAN으로 패턴 매칭된 모든 키 찾기 (완전 무효화)
+      const client = await redisClient.ensureConnection();
       
-      const keysToDelete = [];
+      if (redisClient.useMock) {
+        // Mock 클라이언트 사용 시 - 메모리에서 직접 삭제
+        const mockStore = client._mockStore || new Map();
+        const keysToDelete = [];
+        
+        for (const key of mockStore.keys()) {
+          if (key.startsWith('rooms:list:')) {
+            keysToDelete.push(key);
+          }
+        }
+        
+        keysToDelete.forEach(key => mockStore.delete(key));
+        console.log(`[Cache] Mock - Room list cache invalidated: ${keysToDelete.length} keys`);
+        return;
+      }
       
-      for (let page = 0; page < 5; page++) { // 첫 10페이지만 무효화
-        for (const sortField of sortFields) {
-          for (const sortOrder of sortOrders) {
-            for (const search of searchTerms) {
-              keysToDelete.push(this.getKey('ROOM_LIST', page, sortField, sortOrder, search));
+      // 실제 Redis 클라이언트 사용 시
+      try {
+        // SCAN으로 패턴 매칭
+        const keys = await client.keys('rooms:list:*');
+        
+        if (keys.length > 0) {
+          // 배치로 삭제 (Redis 성능 최적화)
+          const batchSize = 100;
+          let deletedCount = 0;
+          
+          for (let i = 0; i < keys.length; i += batchSize) {
+            const batch = keys.slice(i, i + batchSize);
+            await client.del(...batch);
+            deletedCount += batch.length;
+          }
+          
+          console.log(`[Cache] Redis - Room list cache invalidated: ${deletedCount} keys`);
+        } else {
+          console.log('[Cache] No room list cache keys found to invalidate');
+        }
+        
+      } catch (scanError) {
+        console.warn('[Cache] SCAN failed, using fallback invalidation:', scanError.message);
+        
+        // SCAN 실패 시 폴백: 주요 조합만 무효화
+        const fallbackKeys = [];
+        const sortFields = ['createdAt', 'name', 'participantsCount'];
+        const sortOrders = ['asc', 'desc'];
+        const searchTerms = ['all', '', 'undefined', 'null'];
+        
+        // 첫 10페이지의 주요 조합들
+        for (let page = 0; page < 10; page++) {
+          for (const sortField of sortFields) {
+            for (const sortOrder of sortOrders) {
+              for (const search of searchTerms) {
+                fallbackKeys.push(this.getKey('ROOM_LIST', page, sortField, sortOrder, search));
+              }
             }
           }
         }
+        
+        await this.invalidateMultiple(fallbackKeys);
+        console.log(`[Cache] Fallback invalidation completed: ${fallbackKeys.length} keys`);
       }
       
-      await this.invalidateMultiple(keysToDelete);
-      console.log(`[Cache] Room list cache invalidated: ${keysToDelete.length} keys`);
     } catch (error) {
       console.error('Cache invalidateRoomsListCache error:', error);
+      
+      // 최후의 수단: TTL 기반 만료 대기
+      console.warn('[Cache] Using TTL-based expiration as fallback');
     }
   }
 

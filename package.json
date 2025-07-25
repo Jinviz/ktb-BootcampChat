@@ -13,10 +13,22 @@
     "start": "concurrently \"npm run start:backend\" \"npm run start:frontend\"",
     "start:backend": "cd backend && npm start",
     "start:frontend": "cd frontend && npm start",
-    "test": "cd e2e && npm test"
+    "test": "cd e2e && npm test",
+    "monitor": "node scripts/monitor-extreme-survival.js",
+    "monitor:dev": "API_URL=http://localhost:8080 node scripts/monitor-extreme-survival.js",
+    "monitor:prod": "node scripts/monitor-extreme-survival.js --url http://production-server:8080",
+    "db:reset": "node scripts/reset-database.js",
+    "db:reset:force": "node scripts/reset-database.js --force",
+    "db:reset:primary": "node scripts/find-primary-node.js --force",
+    "db:find": "node scripts/find-accessible-database.js",
+    "db:clear": "node scripts/find-accessible-database.js --force",
+    "clean:all": "node scripts/clean-all-data.js --force",
+    "clean:mongodb": "node scripts/reset-database.js --force"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "axios": "^1.6.0",
+    "chalk": "^4.1.2"
   },
   "author": "",
   "license": "ISC",

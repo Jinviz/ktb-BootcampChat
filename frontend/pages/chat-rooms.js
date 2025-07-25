@@ -506,11 +506,35 @@ function ChatRoomsComponent() {
             setConnectionStatus(CONNECTION_STATUS.ERROR);
           },
           roomCreated: (newRoom) => {
+            console.log('[Socket] Room created event received:', newRoom);
             setRooms(prev => {
               const updatedRooms = [newRoom, ...prev];
               previousRoomsRef.current = updatedRooms;
               return updatedRooms;
             });
+            Toast.success(`새로운 채팅방 "${newRoom.name}"이 생성되었습니다.`);
+          },
+          refreshRoomList: (data) => {
+            console.log('[Socket] Refresh room list event received:', data);
+            // 캐시 무효화로 인한 새로고침 요청
+            setTimeout(() => {
+              lastLoadedPageRef.current = 0;
+              setPageIndex(0);
+              fetchRooms(false);
+            }, 500); // 500ms 후 새로고침 (서버 캐시 무효화 완료 대기)
+            
+            if (data.roomName) {
+              Toast.info(`채팅방 "${data.roomName}"이 업데이트되었습니다. 목록을 새로고침합니다.`);
+            }
+          },
+          roomParticipantUpdate: (data) => {
+            console.log('[Socket] Room participant update:', data);
+            // 참여자 수 변경 시 해당 방 정보만 업데이트
+            setRooms(prev => prev.map(room => 
+              room._id === data.roomId 
+                ? { ...room, participantsCount: data.participantsCount }
+                : room
+            ));
           },
           roomDeleted: (roomId) => {
             setRooms(prev => {

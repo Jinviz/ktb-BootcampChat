@@ -281,21 +281,111 @@ router.post('/', auth, async (req, res) => {
       hasPassword: !!savedRoom.password,
       creator: creatorInfo,
       participants: [creatorInfo],
-      createdAt: savedRoom.createdAt
+      participantsCount: 1,
+      createdAt: savedRoom.createdAt,
+      isCreator: true
     };
 
     // 🚀 새 방 정보를 캐시에 저장
     await CacheService.updateRoomInfoCache(savedRoom._id, populatedRoom);
     
-    // 🚀 방 목록 캐시 무효화
+    // 🚀 방 목록 캐시 완전 무효화 (즉시 실행)
+    console.log(`[API] Room created: ${savedRoom._id}, invalidating cache...`);
     await CacheService.invalidateRoomsListCache();
     
-    // Socket.IO를 통해 새 채팅방 생성 알림
+    // 🚀 캐시 워밍업: 첫 페이지 미리 로딩
+    setTimeout(async () => {
+      try {
+        console.log('[API] Warming up room list cache...');
+        
+        // 가장 자주 사용되는 조합들 미리 캐싱
+        const commonQueries = [
+          { page: 0, sortField: 'createdAt', sortOrder: 'desc', search: '' },
+          { page: 0, sortField: 'createdAt', sortOrder: 'desc', search: 'all' },
+          { page: 0, sortField: 'name', sortOrder: 'asc', search: '' }
+        ];
+        
+        for (const query of commonQueries) {
+          // 실제 DB 조회 후 캐시 저장 (rooms.js의 로직과 동일)
+          const filter = {};
+          if (query.search && query.search !== 'all') {
+            filter.name = { $regex: query.search, $options: 'i' };
+          }
+          
+          const totalCount = await Room.countDocuments(filter);
+          const rooms = await Room.find(filter)
+            .populate({ path: 'creator', select: 'name email profileImage', options: { lean: true } })
+            .populate({ path: 'participants', select: 'name email profileImage', options: { lean: true } })
+            .select('name hasPassword creator participants createdAt')
+            .sort({ [query.sortField]: query.sortOrder === 'desc' ? -1 : 1 })
+            .limit(10)
+            .lean();
+          
+          const safeRooms = rooms.map(room => {
+            if (!room) return null;
+            const creator = room.creator || { _id: 'unknown', name: '알 수 없음', email: '' };
+            const participants = Array.isArray(room.participants) ? room.participants : [];
+            
+            return {
+              _id: room._id?.toString() || 'unknown',
+              name: room.name || '제목 없음',
+              hasPassword: !!room.hasPassword,
+              creator: {
+                _id: creator._id?.toString() || 'unknown',
+                name: creator.name || '알 수 없음',
+                email: creator.email || '',
+                profileImage: creator.profileImage || ''
+              },
+              participants: participants.filter(p => p && p._id).map(p => ({
+                _id: p._id.toString(),
+                name: p.name || '알 수 없음',
+                email: p.email || '',
+                profileImage: p.profileImage || ''
+              })),
+              participantsCount: participants.length,
+              createdAt: room.createdAt || new Date(),
+              isCreator: creator._id?.toString() === req.user.id,
+            };
+          }).filter(room => room !== null);
+          
+          const warmupData = {
+            data: safeRooms,
+            metadata: {
+              total: totalCount,
+              page: query.page,
+              pageSize: 10,
+              totalPages: Math.ceil(totalCount / 10),
+              hasMore: totalCount > 10,
+              currentCount: safeRooms.length,
+              sort: { field: query.sortField, order: query.sortOrder }
+            }
+          };
+          
+          await CacheService.setRoomsList(query.page, 10, query.sortField, query.sortOrder, query.search, warmupData);
+        }
+        
+        console.log('[API] Room list cache warmup completed');
+      } catch (warmupError) {
+        console.error('[API] Cache warmup failed:', warmupError);
+      }
+    }, 100); // 100ms 후 비동기 실행
+    
+    // Socket.IO를 통해 새 채팅방 생성 알림 (전역 브로드캐스트)
     if (io) {
-      io.to('room-list').emit('roomCreated', {
+      // 방 목록 페이지에 있는 모든 사용자에게 알림
+      io.emit('roomCreated', {
         ...populatedRoom,
         password: undefined
       });
+      
+      // 방 목록 새로고침 요청
+      io.emit('refreshRoomList', {
+        reason: 'new_room_created',
+        roomId: savedRoom._id.toString(),
+        roomName: savedRoom.name
+      });
+      
+      console.log(`[Socket] Broadcasted room creation: ${savedRoom._id}`);
     }
     
     res.status(201).json({
@@ -303,14 +393,16 @@ router.post('/', auth, async (req, res) => {
       data: {
         ...populatedRoom,
         password: undefined
-      }
+      },
+      message: '채팅방이 성공적으로 생성되었습니다.'
     });
+    
   } catch (error) {
     console.error('방 생성 에러:', error);
     res.status(500).json({ 
       success: false,
       message: '서버 에러가 발생했습니다.',
-      error: error.message 
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -379,28 +471,51 @@ router.post('/:roomId/join', auth, async (req, res) => {
       }
     }
 
+    let participantAdded = false;
+    
     // 참여자 목록에 추가
     if (!room.participants.includes(req.user.id)) {
       room.participants.push(req.user.id);
       await room.save();
+      participantAdded = true;
 
-      // 🚀 관련 캐시 무효화
+      console.log(`[API] User ${req.user.id} joined room ${req.params.roomId}`);
+
+      // 🚀 관련 캐시 즉시 무효화 (참여자 수 변경으로 인한 목록 업데이트)
       await Promise.all([
         CacheService.invalidateRoomInfo(req.params.roomId),
         CacheService.invalidateRoomParticipants(req.params.roomId),
-        CacheService.invalidateRoomsListCache()
+        CacheService.invalidateRoomsListCache() // 참여자 수 변경으로 목록도 무효화
       ]);
+      
+      console.log(`[API] Cache invalidated for room join: ${req.params.roomId}`);
     }
 
     // 🚀 업데이트된 방 정보를 캐시에서 가져오기
     const populatedRoom = await CacheService.getRoomInfo(req.params.roomId);
 
     // Socket.IO를 통해 참여자 업데이트 알림
-    if (io) {
+    if (io && participantAdded) {
+      // 해당 방의 모든 참여자에게 알림
       io.to(req.params.roomId).emit('roomUpdate', {
         ...populatedRoom,
-        password: undefined
+        password: undefined,
+        action: 'user_joined',
+        newParticipant: {
+          _id: req.user.id,
+          name: req.user.name,
+          email: req.user.email
+        }
       });
+      
+      // 방 목록에도 참여자 수 업데이트 알림
+      io.emit('roomParticipantUpdate', {
+        roomId: req.params.roomId,
+        participantsCount: populatedRoom.participants?.length || 0,
+        action: 'joined'
+      });
+      
+      console.log(`[Socket] Broadcasted room join: ${req.params.roomId}`);
     }
 
     res.json({
@@ -408,14 +523,15 @@ router.post('/:roomId/join', auth, async (req, res) => {
       data: {
         ...populatedRoom,
         password: undefined
-      }
+      },
+      message: participantAdded ? '채팅방에 참여했습니다.' : '이미 참여 중인 채팅방입니다.'
     });
   } catch (error) {
     console.error('방 입장 에러:', error);
     res.status(500).json({
       success: false,
       message: '서버 에러가 발생했습니다.',
-      error: error.message
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
