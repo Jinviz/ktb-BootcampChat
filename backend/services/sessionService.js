@@ -2,7 +2,7 @@ const redisClient = require('../utils/redisClient');
 const crypto = require('crypto');
 
 class SessionService {
-  static SESSION_TTL = 24 * 60 * 60; // 24 hours
+  static SESSION_TTL = 6 * 60 * 60; // 6 hours
   static SESSION_PREFIX = 'session:';
   static SESSION_ID_PREFIX = 'sessionId:';
   static USER_SESSIONS_PREFIX = 'user_sessions:';

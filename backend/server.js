@@ -82,7 +82,15 @@ app.use('/api', routes);
 console.log('API routes mounted successfully');
 
 // Socket.IO 설정
-const io = socketIO(server, {cors: corsOptions});
+const io = socketIO(server, {
+  cors: corsOptions,
+  pingTimeout: 45000,      // 45초 (45000밀리초)
+  pingInterval: 20000,     // 20초 (pingTimeout보다 짧아야 함)
+  maxHttpBufferSize: 512000, // 512KB
+  allowEIO3: true,         // 하위 호환성
+  transports: ['websocket'],
+  compression: true
+});
 require('./sockets/chat')(io);
 
 // Socket.IO 객체 전달
@@ -109,7 +117,15 @@ app.use((err, req, res, next) => {
 });
 
 // 서버 시작
-mongoose.connect(process.env.MONGO_URI)
+mongoose.connect(process.env.MONGO_URI, {
+  maxPoolSize: 50,        // 최대 연결 수 증가 (기본 10 → 100)
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 60000,  // Socket 타임아웃 증가
+  bufferMaxEntries: 0,
+  maxIdleTimeMS: 30000,
+  minPoolSize: 10,         // 최소 연결 수 유지
+  maxConnecting: 20        // 동시 연결 시도 수 증가
+})
 .then(() => {
   console.log('MongoDB Connected');
   server.listen(PORT, '0.0.0.0', () => {

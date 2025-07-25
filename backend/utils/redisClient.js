@@ -241,10 +241,7 @@ class RedisClient {
       } else {
         stringValue = String(value);
       }
-
-      if (options.ttl) {
-        return await client.setex(key, options.ttl, stringValue);
-      }
+4
       return await client.set(key, stringValue);
     } catch (error) {
       console.error('Redis set error:', error);

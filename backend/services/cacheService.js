@@ -5,11 +5,11 @@ const Room = require('../models/Room');
 class CacheService {
   // TTL 설정 (초 단위)
   static TTL = {
-    USER_INFO: 1800,        // 30분
+    USER_INFO: 900,        // 30분
     ROOM_INFO: 600,         // 10분
     ROOM_LIST: 300,         // 5분
-    ROOM_PARTICIPANTS: 900, // 15분
-    USER_SEARCH: 600        // 10분
+    ROOM_PARTICIPANTS: 300, // 5분
+    USER_SEARCH: 300        // 5분
   };
 
   // 캐시 키 생성 헬퍼
@@ -207,7 +207,7 @@ class CacheService {
       
       const keysToDelete = [];
       
-      for (let page = 0; page < 10; page++) { // 첫 10페이지만 무효화
+      for (let page = 0; page < 5; page++) { // 첫 10페이지만 무효화
         for (const sortField of sortFields) {
           for (const sortOrder of sortOrders) {
             for (const search of searchTerms) {

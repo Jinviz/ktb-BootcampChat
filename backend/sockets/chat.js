@@ -16,12 +16,40 @@ module.exports = function(io) {
   const userRooms = new Map();
   const messageQueues = new Map();
   const messageLoadRetries = new Map();
-  const BATCH_SIZE = 30;  // 한 번에 로드할 메시지 수
-  const LOAD_DELAY = 300; // 메시지 로드 딜레이 (ms)
+  const queueTimestamps = new Map(); // 큐 생성 시간 추적용
+  const BATCH_SIZE = 15;  // 한 번에 로드할 메시지 수 (30 → 15)
+  const LOAD_DELAY = 100; // 메시지 로드 딜레이 (300ms → 100ms)
   const MAX_RETRIES = 3;  // 최대 재시도 횟수
   const MESSAGE_LOAD_TIMEOUT = 10000; // 메시지 로드 타임아웃 (10초)
   const RETRY_DELAY = 2000; // 재시도 간격 (2초)
   const DUPLICATE_LOGIN_TIMEOUT = 10000; // 중복 로그인 타임아웃 (10초)
+
+  // 메모리 정리를 위한 정기적인 Map 정리
+  setInterval(() => {
+    const now = Date.now();
+    
+    // 5분 이상 비활성 스트리밍 세션 정리
+    for (const [messageId, session] of streamingSessions.entries()) {
+      if (now - session.lastUpdate > 300000) { // 5분
+        streamingSessions.delete(messageId);
+      }
+    }
+    
+    // 10분 이상 비활성 메시지 큐 정리
+    for (const [queueKey, timestamp] of queueTimestamps.entries()) {
+      if (now - timestamp > 600000) { // 10분
+        messageQueues.delete(queueKey);
+        messageLoadRetries.delete(queueKey);
+        queueTimestamps.delete(queueKey);
+      }
+    }
+    
+    console.debug('[Socket.IO] Memory cleanup completed', {
+      streamingSessions: streamingSessions.size,
+      messageQueues: messageQueues.size,
+      connectedUsers: connectedUsers.size
+    });
+  }, 300000); // 5분마다 실행
 
   // 로깅 유틸리티 함수
   const logDebug = (action, data) => {
@@ -445,6 +473,7 @@ module.exports = function(io) {
         }
 
         messageQueues.set(queueKey, true);
+        queueTimestamps.set(queueKey, Date.now()); // 타임스탬프 추가
         socket.emit('messageLoadStart');
 
         const result = await loadMessagesWithRetry(socket, roomId, before);
@@ -467,6 +496,7 @@ module.exports = function(io) {
       } finally {
         setTimeout(() => {
           messageQueues.delete(queueKey);
+          queueTimestamps.delete(queueKey);
         }, LOAD_DELAY);
       }
     });
@@ -868,6 +898,7 @@ module.exports = function(io) {
             const queueKey = `${roomId}:${socket.user.id}`;
             messageQueues.delete(queueKey);
             messageLoadRetries.delete(queueKey);
+            queueTimestamps.delete(queueKey);
 
             // 이벤트 발송
             io.to(roomId).emit('message', leaveMessage);
@@ -904,6 +935,7 @@ module.exports = function(io) {
         userQueues.forEach(key => {
           messageQueues.delete(key);
           messageLoadRetries.delete(key);
+          queueTimestamps.delete(key);
         });
         
         // 스트리밍 세션 정리
