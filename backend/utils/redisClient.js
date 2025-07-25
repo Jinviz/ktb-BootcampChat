@@ -5,6 +5,7 @@ const { redisHost, redisPort } = require('../config/keys');
 class MockRedisClient {
   constructor() {
     this.store = new Map();
+    this.subscribers = new Map();
     this.isConnected = true;
     console.log('Using in-memory Redis mock (Redis server not available)');
   }
@@ -52,8 +53,68 @@ class MockRedisClient {
     return 0;
   }
 
+  // Hash 연산 메서드 추가
+  async hset(key, field, value) {
+    const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    if (!this.store.has(key)) {
+      this.store.set(key, new Map());
+    }
+    const hash = this.store.get(key);
+    if (hash instanceof Map) {
+      hash.set(field, stringValue);
+      return 1;
+    }
+    return 0;
+  }
+
+  async hget(key, field) {
+    const hash = this.store.get(key);
+    if (hash instanceof Map) {
+      const value = hash.get(field);
+      if (!value) return null;
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  async hdel(key, field) {
+    const hash = this.store.get(key);
+    if (hash instanceof Map) {
+      return hash.delete(field) ? 1 : 0;
+    }
+    return 0;
+  }
+
+  // Pub/Sub 메서드 추가
+  async publish(channel, message) {
+    console.log(`[Mock Redis] Publishing to channel ${channel}:`, message);
+    return 1; // 구독자 수 (Mock에서는 항상 1)
+  }
+
+  async subscribe(...channels) {
+    console.log(`[Mock Redis] Subscribing to channels:`, channels);
+    channels.forEach(channel => {
+      this.subscribers.set(channel, true);
+    });
+    
+    // Mock subscribe는 즉시 완료
+    return Promise.resolve();
+  }
+
+  // EventEmitter 흉내내기
+  on(event, callback) {
+    console.log(`[Mock Redis] Event listener registered for: ${event}`);
+    // Mock에서는 실제 이벤트 발생하지 않음
+    return this;
+  }
+
   async quit() {
     this.store.clear();
+    this.subscribers.clear();
     console.log('Mock Redis connection closed');
   }
 }
@@ -239,7 +300,7 @@ class RedisClient {
             enableOfflineQueue: false, // 성능 최적화
             family: 4,
             keepAlive: true,
-            lazyConnect: false,        // 즉시 연결
+            lazyConnect: true,         // 지연 연결로 변경
             
             // 클러스터 최적화 설정
             enableReadyCheck: false,   // 빠른 시작
@@ -253,12 +314,16 @@ class RedisClient {
           clusterRetryDelayOnClusterDown: 300,
           clusterRetryDelayOnFailover: 25,
           enableReadyCheck: false,     // 빠른 시작
-          lazyConnect: false,          // 즉시 연결
+          lazyConnect: true,           // 지연 연결로 변경
           
           // 클러스터 토폴로지 최적화
           slotsRefreshTimeout: 1000,   // 슬롯 새로고침 1초
           slotsRefreshInterval: 5000,  // 5초마다 새로고침
-          maxRetriesPerRequest: 5      // 명시적 설정
+          maxRetriesPerRequest: 5,     // 명시적 설정
+          
+          // 네트워크 타임아웃 관련
+          clusterRetryDelayOnFailover: 25,
+          dnsLookupTimeout: 1000       // DNS 조회 타임아웃 1초
         });
 
         this.client.on('connect', () => {
@@ -287,15 +352,19 @@ class RedisClient {
 
         // 연결 테스트 (타임아웃 적용)
         const connectTimeout = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('Connection timeout')), 15000); // 15초로 증가
+          setTimeout(() => reject(new Error('Connection timeout')), 5000); // 15초 → 5초로 단축
         });
 
-        await Promise.race([
-          this.client.ping(),
-          connectTimeout
-        ]);
-
-        console.log('Redis Cluster ping successful');
+        try {
+          await Promise.race([
+            this.client.ping(),
+            connectTimeout
+          ]);
+          console.log('Redis Cluster ping successful');
+        } catch (pingError) {
+          console.warn('Redis Cluster ping failed, but continuing with lazy connection:', pingError.message);
+          // ping 실패해도 lazy connection으로 계속 진행
+        }
 
       } else {
         // 단일 Redis 모드
